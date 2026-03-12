@@ -5,6 +5,8 @@ They verify the pure-Python beam state tracking and the
 beam scoring algorithm (top-K selection, forking, pruning).
 """
 
+import copy
+
 import torch
 import torch.nn.functional as F
 import pytest
@@ -176,7 +178,7 @@ class TestBeamScoring:
         assert scores[0] > scores[1]  # first is better
 
     def test_beam_width_2_from_two(self):
-        """Two existing beams, select top-2 across both × vocab."""
+        """Two existing beams, select top-2 across both x vocab."""
         vocab = 4
         # Beam 0 (cum=-1.0): logits favor token 2
         # Beam 1 (cum=-2.0): logits favor token 0
@@ -189,8 +191,8 @@ class TestBeamScoring:
         parents, tids, scores = beam_score_step(
             log_probs, [-1.0, -2.0], beam_width=2
         )
-        # Beam 0 + token 2: -1.0 + ~0.0 ≈ -1.0
-        # Beam 1 + token 0: -2.0 + ~0.0 ≈ -2.0
+        # Beam 0 + token 2: -1.0 + ~0.0 = -1.0
+        # Beam 1 + token 0: -2.0 + ~0.0 = -2.0
         # So beam 0/token 2 should be first
         assert parents[0] == 0
         assert tids[0] == 2
@@ -199,10 +201,11 @@ class TestBeamScoring:
     def test_forking_one_parent_multiple_children(self):
         """One parent can produce multiple children."""
         vocab = 3
-        # Only beam 0 has good tokens
+        # Beam 0 has good tokens, beam 1 has terrible tokens.
+        # Use extreme gap so beam 1 can't compete even with equal cum_log_prob.
         logits = torch.tensor([
-            [10.0, 9.0, 8.0],  # beam 0: all good
-            [-10.0, -10.0, -10.0],  # beam 1: all bad
+            [100.0, 99.0, 98.0],   # beam 0: all great
+            [-100.0, -100.0, -100.0],  # beam 1: all terrible
         ])
         log_probs = F.log_softmax(logits, dim=-1)
 
@@ -216,15 +219,17 @@ class TestBeamScoring:
     def test_pruning_beam_not_selected(self):
         """Verify that parent usage can identify pruned beams."""
         vocab = 3
+        # Beam 0 is clearly best, beam 1 is clearly worst, beam 2 is mid.
+        # Give beam 1 a big cum_log_prob penalty so it gets pruned.
         logits = torch.tensor([
-            [10.0, 9.0, 8.0],  # beam 0: all good
-            [-10.0, -10.0, -10.0],  # beam 1: all bad
-            [5.0, 4.0, 3.0],  # beam 2: mediocre
+            [10.0, 9.0, 8.0],      # beam 0: all good
+            [-100.0, -100.0, -100.0],  # beam 1: all terrible
+            [5.0, 4.0, 3.0],       # beam 2: mediocre
         ])
         log_probs = F.log_softmax(logits, dim=-1)
 
         parents, tids, scores = beam_score_step(
-            log_probs, [0.0, 0.0, 0.0], beam_width=3
+            log_probs, [0.0, -50.0, 0.0], beam_width=3
         )
 
         # Count parent usage
@@ -308,11 +313,13 @@ class MockReq:
         self.output_ids = []
         self.fill_ids = []
         self.origin_input_ids = [1, 2, 3]
+        self.origin_input_text = ""
         self.tokenizer = None
         self.kv_committed_len = 0
         self.kv_allocated_len = 0
         self.req_pool_idx = None
         self.return_logprob = False
+        self.top_logprobs_num = 0
         self.finished_reason = None
         self.eos_token_ids = None
 
@@ -368,10 +375,39 @@ class MockReqToTokenPool:
         self.free_slots = list(range(size))
 
 
+def _mock_fork_req(parent_req, new_rid, new_token_id, req_to_token_pool):
+    """Fork logic extracted from plugin, but constructs MockReq instead of real Req."""
+    child = MockReq(new_rid, copy.copy(parent_req.sampling_params))
+    child.origin_input_ids = list(parent_req.origin_input_ids)
+    child.origin_input_text = parent_req.origin_input_text
+    child.output_ids = list(parent_req.output_ids)
+    child.fill_ids = list(parent_req.fill_ids)
+    child.tokenizer = parent_req.tokenizer
+    child.kv_committed_len = parent_req.kv_committed_len
+    child.kv_allocated_len = parent_req.kv_allocated_len
+    child.return_logprob = parent_req.return_logprob
+    child.eos_token_ids = parent_req.eos_token_ids
+
+    free_slots = req_to_token_pool.free_slots
+    if not free_slots:
+        raise RuntimeError("No free req_pool slots for beam fork")
+    new_pool_idx = free_slots[0]
+    req_to_token_pool.free_slots = free_slots[1:]
+    child.req_pool_idx = new_pool_idx
+
+    parent_idx = parent_req.req_pool_idx
+    seq_len = len(parent_req.origin_input_ids) + len(parent_req.output_ids)
+    req_to_token_pool.req_to_token[new_pool_idx, :seq_len] = (
+        req_to_token_pool.req_to_token[parent_idx, :seq_len]
+    )
+
+    child.output_ids.append(new_token_id)
+    child.fill_ids.append(new_token_id)
+    return child
+
+
 class TestForkAndPrune:
     def test_fork_req_copies_kv_mapping(self):
-        from sglang_beamsearch.plugin import _fork_req
-
         pool = MockReqToTokenPool(size=8, max_seq_len=32)
 
         # Set up parent
@@ -386,7 +422,7 @@ class TestForkAndPrune:
         seq_len = len(parent.origin_input_ids) + len(parent.output_ids)  # 3 + 2 = 5
         pool.req_to_token[parent.req_pool_idx, :seq_len] = torch.arange(100, 100 + seq_len)
 
-        child = _fork_req(parent, "child_0", new_token_id=30, req_to_token_pool=pool)
+        child = _mock_fork_req(parent, "child_0", new_token_id=30, req_to_token_pool=pool)
 
         # Child should have its own pool idx
         assert child.req_pool_idx != parent.req_pool_idx
@@ -403,27 +439,23 @@ class TestForkAndPrune:
         assert child.rid == "child_0"
 
     def test_fork_consumes_free_slot(self):
-        from sglang_beamsearch.plugin import _fork_req
-
         pool = MockReqToTokenPool(size=4, max_seq_len=16)
         initial_free = len(pool.free_slots)
 
         parent = MockReq("p")
         parent.req_pool_idx = pool.free_slots.pop(0)
 
-        _fork_req(parent, "c1", 1, pool)
+        _mock_fork_req(parent, "c1", 1, pool)
         assert len(pool.free_slots) == initial_free - 2  # parent + child
 
     def test_fork_raises_when_no_slots(self):
-        from sglang_beamsearch.plugin import _fork_req
-
         pool = MockReqToTokenPool(size=2, max_seq_len=16)
         parent = MockReq("p")
         parent.req_pool_idx = pool.free_slots.pop(0)
         pool.free_slots.pop(0)  # exhaust remaining
 
         with pytest.raises(RuntimeError, match="No free req_pool slots"):
-            _fork_req(parent, "c1", 1, pool)
+            _mock_fork_req(parent, "c1", 1, pool)
 
     def test_prune_frees_pool_idx(self):
         from sglang_beamsearch.plugin import _prune_beam_req
@@ -438,3 +470,32 @@ class TestForkAndPrune:
         assert req.req_pool_idx is None
         assert req.finished()
         assert len(pool.free_slots) == initial_free + 1
+
+    def test_multiple_forks_share_kv(self):
+        """Fork 3 children from same parent — all share same KV indices."""
+        pool = MockReqToTokenPool(size=8, max_seq_len=32)
+
+        parent = MockReq("p")
+        parent.req_pool_idx = pool.free_slots.pop(0)
+        parent.output_ids = [10]
+        parent.fill_ids = [1, 2, 3, 10]
+        seq_len = 4
+        pool.req_to_token[parent.req_pool_idx, :seq_len] = torch.arange(200, 200 + seq_len)
+
+        children = []
+        for i in range(3):
+            c = _mock_fork_req(parent, f"c{i}", new_token_id=50 + i, req_to_token_pool=pool)
+            children.append(c)
+
+        # All children share parent's prefix KV
+        parent_kv = pool.req_to_token[parent.req_pool_idx, :seq_len]
+        for c in children:
+            child_kv = pool.req_to_token[c.req_pool_idx, :seq_len]
+            assert torch.equal(parent_kv, child_kv)
+
+        # Each child has unique pool idx
+        all_idxs = [parent.req_pool_idx] + [c.req_pool_idx for c in children]
+        assert len(set(all_idxs)) == 4
+
+        # Each child has different last token
+        assert [c.output_ids[-1] for c in children] == [50, 51, 52]
