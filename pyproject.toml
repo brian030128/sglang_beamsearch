@@ -9,10 +9,21 @@ description = "Beam search plugin for SGLang via monkeypatching"
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.0",
+    "requests",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest"]
 
+[project.scripts]
+sglang-beamsearch-bench = "sglang_beamsearch.bench:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.uv]
+dev-dependencies = ["pytest"]
+
+[tool.uv.sources]
+# sglang is installed from the local checkout
+sglang = { path = "../sglang/python", editable = true }
