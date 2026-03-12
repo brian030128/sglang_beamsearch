@@ -7,18 +7,24 @@ Usage:
 import os
 import sys
 
-from sglang_beamsearch import load_beam_search_plugin
 
-# Apply monkeypatches BEFORE sglang starts
-load_beam_search_plugin()
+def main():
+    from sglang_beamsearch import load_beam_search_plugin
 
-from sglang.srt.server_args import prepare_server_args
-from sglang.launch_server import run_server
-from sglang.srt.utils import kill_process_tree
+    # Apply monkeypatches BEFORE sglang starts
+    load_beam_search_plugin()
 
-server_args = prepare_server_args(sys.argv[1:])
+    from sglang.srt.server_args import prepare_server_args
+    from sglang.launch_server import run_server
+    from sglang.srt.utils import kill_process_tree
 
-try:
-    run_server(server_args)
-finally:
-    kill_process_tree(os.getpid(), include_parent=False)
+    server_args = prepare_server_args(sys.argv[1:])
+
+    try:
+        run_server(server_args)
+    finally:
+        kill_process_tree(os.getpid(), include_parent=False)
+
+
+if __name__ == "__main__":
+    main()
